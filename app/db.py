@@ -54,7 +54,7 @@ CREATE TABLE IF NOT EXISTS leases (
 -- appended inside the same BEGIN IMMEDIATE transaction as the change.
 CREATE TABLE IF NOT EXISTS audit_events (
     seq         INTEGER PRIMARY KEY,  -- 1, 2, 3, ... assigned under the write lock
-    action      TEXT NOT NULL,        -- allocate | renew | release | expire
+    action      TEXT NOT NULL,        -- allocate | renew | release | expire | resize | handoff
     lease_id    INTEGER NOT NULL,
     pool_id     INTEGER NOT NULL,
     cidr        TEXT NOT NULL,
@@ -64,9 +64,23 @@ CREATE TABLE IF NOT EXISTS audit_events (
     hash        TEXT NOT NULL
 );
 
+-- One-time lease handoff codes. Only the SHA-256 digest of a claim code is
+-- stored, never the code itself. At most one row per lease is 'pending' at
+-- any moment: re-issuing supersedes the previous pending code.
+CREATE TABLE IF NOT EXISTS lease_handoffs (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    lease_id    INTEGER NOT NULL REFERENCES leases(id),
+    code_digest TEXT NOT NULL UNIQUE,  -- SHA-256 hex of the claim code
+    status      TEXT NOT NULL DEFAULT 'pending',  -- pending | consumed | superseded
+    expires_at  INTEGER NOT NULL,
+    created_at  INTEGER NOT NULL,
+    consumed_at INTEGER
+);
+
 CREATE INDEX IF NOT EXISTS idx_reservations_pool ON reservations(pool_id);
 CREATE INDEX IF NOT EXISTS idx_leases_pool_status ON leases(pool_id, status);
 CREATE INDEX IF NOT EXISTS idx_leases_token ON leases(token);
+CREATE INDEX IF NOT EXISTS idx_lease_handoffs_lease ON lease_handoffs(lease_id, status);
 """
 
 

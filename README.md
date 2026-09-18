@@ -1,8 +1,9 @@
 # CIDR 地址租约 API
 
 基于 **Python + FastAPI + SQLite + 标准库 `ipaddress`** 的本地 CIDR 地址租约服务。
-支持 IPv4 / IPv6 地址池、保留网段、事务化租约分配、续租/释放、过期自动回收，
-空闲空间的最简 CIDR 集合查询，以及哈希链式租约审计日志。
+支持 IPv4 / IPv6 地址池、保留网段、事务化租约分配、续租/释放、过期自动回收、
+租约控制权交接（一次性领取码），空闲空间的最简 CIDR 集合查询，
+以及哈希链式租约审计日志。
 
 ## 快速启动（单条命令）
 
@@ -50,6 +51,25 @@ docker compose up -d --build
   `resize` 审计事件都在**同一个 `BEGIN IMMEDIATE` 事务**内完成，
   失败整体回滚、不留事件。
 
+## 租约控制权交接
+
+两步即可把租约控制权移交给另一方，无需让对方知晓旧令牌（服务监听 **8000 端口**）：
+
+1. **签发**：当前持有方调用 `POST /leases/{token}/handoffs`
+   （可带 `{"ttl_seconds": <1~3600>}`，默认 300 秒），为**活动租约**签发一个
+   随机 `claim_code`，响应返回该码及 `expires_at`。数据库只保存交接码的
+   **SHA-256 摘要**，不明文落库；同一租约再次签发会使旧码立即失效（superseded）。
+   非活动租约（已释放/已过期）返回 `409`，未知令牌返回 `404`。
+2. **领取**：接收方在有效期内调用 `POST /lease-handoffs/{claim_code}/claim`，
+   在**同一个 `BEGIN IMMEDIATE` 事务**内消费交接码、**轮换租约 token** 并返回租约
+   （**CIDR 与到期时间不变**），同事务追加一条 `handoff` 审计事件。
+
+- 领取成功后**旧 token 立即失效**，此后按未知令牌返回 `404`；新 token 仅随
+  领取响应返回一次。
+- 并发领取同一交接码：仅一个请求成功，其余返回 `409`；交接码**过期、已消费、
+  已被新码替换**，或**租约已非活动**同样返回 `409`；从未签发的交接码返回 `404`。
+- 签发与领取的失败均**不追加审计事件**；响应与审计日志都不包含交接码摘要。
+
 ## API 一览
 
 | 方法 | 路径 | 说明 |
@@ -65,6 +85,8 @@ docker compose up -d --build
 | POST | `/leases/{token}/renew` | 续租 |
 | POST | `/leases/{token}/release` | 主动释放 |
 | PUT | `/leases/{token}/resize` | 原地缩/扩容（仅活动租约） |
+| POST | `/leases/{token}/handoffs` | 签发租约交接码（有效期 1~3600 秒，默认 300） |
+| POST | `/lease-handoffs/{claim_code}/claim` | 凭交接码领取租约（轮换 token） |
 | GET | `/audit/events` | 按 `seq` 升序列出租约审计事件 |
 | GET | `/audit/verify` | 校验审计链，返回 `valid` 与首个 `invalid_seq` |
 
@@ -112,6 +134,15 @@ curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
 curl -s -X PUT http://localhost:8000/leases/<TOKEN>/resize \
   -H 'Content-Type: application/json' -d '{"target_prefix_len":29}'
 
+# 6d) 交接第一步：持有方为活动租约签发交接码（有效期 600 秒）
+curl -s -X POST http://localhost:8000/leases/<TOKEN>/handoffs \
+  -H 'Content-Type: application/json' -d '{"ttl_seconds":600}'
+# {"claim_code":"<CLAIM_CODE>","expires_at":...}
+
+# 6e) 交接第二步：接收方凭交接码领取租约（token 轮换，CIDR/到期时间不变）
+curl -s -X POST http://localhost:8000/lease-handoffs/<CLAIM_CODE>/claim
+# {"id":1,...,"token":"<NEW_TOKEN>",...}  —— 旧 TOKEN 此后按未知令牌返回 404
+
 # 7) 查看审计链：allocate → renew → release 各一条事件
 curl -s http://localhost:8000/audit/events
 
@@ -134,16 +165,16 @@ curl -s -X POST http://localhost:8000/pools/2/leases \
 
 ## 租约审计链
 
-租约**分配、续租、释放、过期回收、缩扩容**成功时，会在**同一个 `BEGIN IMMEDIATE`
-事务**内向 `audit_events` 表追加一条事件；操作失败（409/422/404 等）事务回滚，
-**不会留下任何事件**。
+租约**分配、续租、释放、过期回收、缩扩容、控制权交接**成功时，会在**同一个
+`BEGIN IMMEDIATE` 事务**内向 `audit_events` 表追加一条事件；操作失败
+（409/422/404 等）事务回滚，**不会留下任何事件**。
 
 每条事件包含：
 
 | 字段 | 说明 |
 |---|---|
 | `seq` | 从 1 开始连续递增的序号（写锁内分配，并发安全） |
-| `action` | `allocate` / `renew` / `release` / `expire` / `resize` |
+| `action` | `allocate` / `renew` / `release` / `expire` / `resize` / `handoff` |
 | `lease_id` / `pool_id` | 租约与地址池标识 |
 | `cidr` | 租约网段（`resize` 事件为变更后的网段） |
 | `occurred_at` | 事件时间（Unix 秒） |
@@ -164,7 +195,7 @@ hash = SHA256( prev_hash || json_sorted_compact(seq, action, lease_id,
   返回 `{"valid": true, "invalid_seq": null}`；若被篡改，返回 `valid: false`
   及首个失效事件的 `invalid_seq`。
 
-> 审计日志不包含租约令牌（token），避免凭据经只读接口泄露。
+> 审计日志不包含租约令牌（token）、交接码及其摘要，避免凭据经只读接口泄露。
 
 ## 测试
 
@@ -181,6 +212,10 @@ pytest -q
 非活动租约 409、IPv6 双向调整。
 审计链覆盖：五类事件记录与哈希链接、失败操作不记录、过期回收事件、
 空链有效，以及篡改事件内容 / 破坏 `prev_hash` 链接时 `verify` 能定位首个失效 `seq`。
+交接覆盖：签发 TTL 边界（1~3600，默认 300）、重复签发使旧码失效、领取轮换 token
+且 CIDR/到期时间不变、旧 token 按未知令牌 404、过期/已消费/被替换/租约非活动 409、
+8 线程并发领取同一交接码仅 1 个成功、`handoff` 审计事件与链完整性、
+响应与日志不含交接码摘要。
 另已在 `uvicorn --workers 2` 多进程部署下验证 32 并发分配 `/24` 池中的 `/28`
 （16 个成功、块唯一且不重叠）。
 
@@ -212,3 +247,6 @@ requirements.txt
   过期记录才取一次写锁，避免只读查询长期加锁。
 - 审计事件与状态变更同事务提交，`seq` 在写锁内按 `MAX(seq)+1` 分配，因此链上
   序号连续无空洞；验链为纯只读操作，不加写锁。
+- 交接码（`claim_code`）仅在签发响应中明文出现一次，数据库只存其 SHA-256 摘要；
+  领取在单个写事务内完成「校验 → 消费 → 轮换 token → 追加 `handoff` 事件」，
+  与租约分配共用同一把 SQLite 写锁，并发领取天然串行化。

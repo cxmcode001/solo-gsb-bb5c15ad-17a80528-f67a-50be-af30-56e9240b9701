@@ -483,3 +483,166 @@ def test_resize_ipv6(client):
         "after_cidr": "2001:db8::/48",
     }
     _assert_chain_linkage(events)
+
+
+# ---------- lease handoffs ----------
+
+def _create_lease(client, cidr="10.0.0.0/24", prefix_len=27, ttl=3600):
+    pid = _create_pool(client, cidr=cidr)
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": prefix_len, "ttl_seconds": ttl}
+    ).json()
+    return pid, lease
+
+
+def test_handoff_issue_and_claim_rotates_token(client):
+    _, lease = _create_lease(client)
+    r = client.post(f"/leases/{lease['token']}/handoffs", json={"ttl_seconds": 600})
+    assert r.status_code == 201
+    body = r.json()
+    assert body["claim_code"]
+    now = int(time.time())
+    assert now + 590 <= body["expires_at"] <= now + 600
+
+    r = client.post(f"/lease-handoffs/{body['claim_code']}/claim")
+    assert r.status_code == 200
+    out = r.json()
+    assert out["id"] == lease["id"]
+    assert out["token"] != lease["token"]  # token rotated
+    assert out["cidr"] == lease["cidr"]  # CIDR unchanged
+    assert out["expires_at"] == lease["expires_at"]  # expiry unchanged
+    assert out["status"] == "active"
+
+    # the old token is now an unknown token -> 404
+    assert client.get(f"/leases/{lease['token']}").status_code == 404
+    assert client.post(f"/leases/{lease['token']}/renew", json={}).status_code == 404
+    # the new token works
+    assert client.get(f"/leases/{out['token']}").status_code == 200
+
+
+def test_handoff_issue_ttl_bounds_and_lease_state(client):
+    _, lease = _create_lease(client)
+    url = f"/leases/{lease['token']}/handoffs"
+    assert client.post(url, json={"ttl_seconds": 0}).status_code == 422
+    assert client.post(url, json={"ttl_seconds": 3601}).status_code == 422
+    assert client.post(url, json={"ttl_seconds": 1}).status_code == 201
+    assert client.post(url, json={"ttl_seconds": 3600}).status_code == 201
+    # no body -> default TTL (300s)
+    r = client.post(url)
+    assert r.status_code == 201
+    now = int(time.time())
+    assert now + 290 <= r.json()["expires_at"] <= now + 300
+    # unknown token -> 404
+    assert client.post("/leases/nope/handoffs", json={}).status_code == 404
+    # released lease -> 409
+    assert client.post(f"/leases/{lease['token']}/release").status_code == 200
+    assert client.post(url, json={}).status_code == 409
+
+
+def test_handoff_issue_expired_lease_409(client):
+    _, lease = _create_lease(client, ttl=1)
+    time.sleep(1.2)
+    assert client.post(f"/leases/{lease['token']}/handoffs", json={}).status_code == 409
+
+
+def test_handoff_reissue_supersedes_previous_code(client):
+    _, lease = _create_lease(client)
+    first = client.post(f"/leases/{lease['token']}/handoffs", json={}).json()
+    second = client.post(f"/leases/{lease['token']}/handoffs", json={}).json()
+    assert first["claim_code"] != second["claim_code"]
+    # the replaced code is dead -> 409
+    assert client.post(f"/lease-handoffs/{first['claim_code']}/claim").status_code == 409
+    # the fresh code works
+    assert client.post(f"/lease-handoffs/{second['claim_code']}/claim").status_code == 200
+
+
+def test_handoff_claim_unknown_and_consumed_code(client):
+    _, lease = _create_lease(client)
+    assert client.post("/lease-handoffs/never-issued/claim").status_code == 404
+    code = client.post(f"/leases/{lease['token']}/handoffs", json={}).json()["claim_code"]
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 200
+    # already consumed -> 409
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_claim_expired_code_409(client):
+    _, lease = _create_lease(client)
+    code = client.post(
+        f"/leases/{lease['token']}/handoffs", json={"ttl_seconds": 1}
+    ).json()["claim_code"]
+    time.sleep(1.2)
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+    # the lease itself is untouched: its token still works
+    assert client.get(f"/leases/{lease['token']}").status_code == 200
+
+
+def test_handoff_claim_requires_active_lease(client):
+    _, lease = _create_lease(client)
+    code = client.post(f"/leases/{lease['token']}/handoffs", json={}).json()["claim_code"]
+    client.post(f"/leases/{lease['token']}/release")
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_claim_lease_expired_before_claim_409(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = client.post(
+        f"/pools/{pid}/leases", json={"prefix_len": 27, "ttl_seconds": 1}
+    ).json()
+    code = client.post(
+        f"/leases/{lease['token']}/handoffs", json={"ttl_seconds": 60}
+    ).json()["claim_code"]
+    time.sleep(1.2)
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_concurrent_claims_only_one_wins(client):
+    _, lease = _create_lease(client)
+    code = client.post(f"/leases/{lease['token']}/handoffs", json={}).json()["claim_code"]
+
+    def claim(_):
+        return client.post(f"/lease-handoffs/{code}/claim")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(claim, range(8)))
+
+    successes = [r for r in results if r.status_code == 200]
+    failures = [r for r in results if r.status_code == 409]
+    assert len(successes) == 1
+    assert len(failures) == 7
+    new_token = successes[0].json()["token"]
+    assert client.get(f"/leases/{new_token}").status_code == 200
+    assert client.get(f"/leases/{lease['token']}").status_code == 404
+    # exactly one handoff event was appended
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "handoff"]
+    _assert_chain_linkage(events)
+
+
+def test_handoff_audit_event_and_no_digest_leak(client):
+    import hashlib
+
+    _, lease = _create_lease(client)
+    r = client.post(f"/leases/{lease['token']}/handoffs", json={"ttl_seconds": 600})
+    code = r.json()["claim_code"]
+    digest = hashlib.sha256(code.encode("utf-8")).hexdigest()
+    # the issuance response returns the code but never its stored digest
+    assert digest not in r.text
+
+    # failed claims leave no event behind
+    assert client.post("/lease-handoffs/never-issued/claim").status_code == 404
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 200
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "handoff"]
+    handoff = events[1]
+    assert handoff["lease_id"] == lease["id"]
+    assert handoff["pool_id"] == lease["pool_id"]
+    assert handoff["cidr"] == lease["cidr"]
+    # neither the code, its digest, nor any token appears in the log
+    blob = str(events)
+    assert code not in blob
+    assert digest not in blob
+    assert lease["token"] not in blob
+    _assert_chain_linkage(events)
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}

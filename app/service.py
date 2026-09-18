@@ -1,5 +1,6 @@
 """Business logic: every mutating operation runs inside BEGIN IMMEDIATE."""
 
+import hashlib
 import secrets
 import sqlite3
 import time
@@ -428,6 +429,103 @@ def resize_lease(
         details={"before_cidr": before_cidr, "after_cidr": new_cidr},
     )
     row = conn.execute("SELECT * FROM leases WHERE id = ?", (row["id"],)).fetchone()
+    return _lease_row_to_dict(row)
+
+
+# ---------- lease handoffs ----------
+
+HANDOFF_DEFAULT_TTL_SECONDS = 300
+HANDOFF_MAX_TTL_SECONDS = 3600
+
+
+def _code_digest(claim_code: str) -> str:
+    """SHA-256 hex of a claim code; the code itself is never stored."""
+    return hashlib.sha256(claim_code.encode("utf-8")).hexdigest()
+
+
+def create_handoff(
+    conn: sqlite3.Connection, token: str, ttl_seconds: int | None = None
+) -> dict:
+    """Issue a one-time claim code for an active lease.
+
+    Only the code's SHA-256 digest is persisted; re-issuing supersedes any
+    still-pending code for the same lease.
+    """
+    now = _now()
+    ttl = ttl_seconds if ttl_seconds is not None else HANDOFF_DEFAULT_TTL_SECONDS
+    if ttl < 1 or ttl > HANDOFF_MAX_TTL_SECONDS:
+        raise ApiError(422, "ttl_seconds must be between 1 and 3600")
+
+    row = _find_lease(conn, token)
+    # Locks are pool-scoped; sweep first so the status check is authoritative.
+    _sweep_pool(conn, row["pool_id"], now)
+    row = _find_lease(conn, token)
+    _require_live(row, now)
+
+    # Re-issuing invalidates any still-pending code for this lease.
+    conn.execute(
+        "UPDATE lease_handoffs SET status = 'superseded' "
+        "WHERE lease_id = ? AND status = 'pending'",
+        (row["id"],),
+    )
+    expires_at = now + ttl
+    for _ in range(3):  # a digest collision is all but impossible; retry anyway
+        claim_code = secrets.token_urlsafe(32)
+        try:
+            conn.execute(
+                "INSERT INTO lease_handoffs "
+                "(lease_id, code_digest, status, expires_at, created_at) "
+                "VALUES (?, ?, 'pending', ?, ?)",
+                (row["id"], _code_digest(claim_code), expires_at, now),
+            )
+        except sqlite3.IntegrityError:
+            continue
+        return {"claim_code": claim_code, "expires_at": expires_at}
+    raise ApiError(500, "could not issue a unique claim code")
+
+
+def claim_handoff(conn: sqlite3.Connection, claim_code: str) -> dict:
+    """Consume a claim code and rotate the lease token, atomically.
+
+    The lease keeps its CIDR and expiry; the old token becomes unknown (404).
+    """
+    now = _now()
+    handoff = conn.execute(
+        "SELECT * FROM lease_handoffs WHERE code_digest = ?",
+        (_code_digest(claim_code),),
+    ).fetchone()
+    if handoff is None:
+        raise ApiError(404, "handoff claim code not found")
+    if handoff["status"] != "pending":
+        raise ApiError(409, "handoff claim code already consumed or superseded")
+    if handoff["expires_at"] <= now:
+        raise ApiError(409, "handoff claim code has expired")
+
+    lease_id = handoff["lease_id"]
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
+    # Locks are pool-scoped; sweep first so the status check is authoritative.
+    _sweep_pool(conn, row["pool_id"], now)
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
+    _require_live(row, now)
+
+    conn.execute(
+        "UPDATE lease_handoffs SET status = 'consumed', consumed_at = ? WHERE id = ?",
+        (now, handoff["id"]),
+    )
+    conn.execute(
+        "UPDATE leases SET token = ? WHERE id = ?",
+        (secrets.token_urlsafe(32), lease_id),
+    )
+    audit.append_event(
+        conn,
+        action=audit.HANDOFF,
+        lease_id=lease_id,
+        pool_id=row["pool_id"],
+        cidr=row["cidr"],
+        occurred_at=now,
+        details={},
+    )
+    row = conn.execute("SELECT * FROM leases WHERE id = ?", (lease_id,)).fetchone()
     return _lease_row_to_dict(row)
 
 
