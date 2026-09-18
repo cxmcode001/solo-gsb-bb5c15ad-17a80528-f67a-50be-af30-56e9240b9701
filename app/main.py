@@ -13,6 +13,8 @@ from .errors import ApiError
 from .schemas import (
     AuditEventOut,
     AuditVerifyOut,
+    HandoffOut,
+    HandoffRequest,
     LeaseOut,
     LeaseRequest,
     PoolCreate,
@@ -134,6 +136,26 @@ def resize_lease(
 ) -> dict:
     with write_tx(db):
         return service.resize_lease(db, token, body.target_prefix_len)
+
+
+# ---------- lease handoffs ----------
+
+@app.post(
+    "/leases/{token}/handoffs",
+    response_model=HandoffOut,
+    status_code=status.HTTP_201_CREATED,
+)
+def create_handoff(
+    token: str, body: HandoffRequest, db: sqlite3.Connection = Depends(get_db)
+) -> dict:
+    with write_tx(db):
+        return service.create_handoff(db, token, body.ttl_seconds)
+
+
+@app.post("/lease-handoffs/{claim_code}/claim", response_model=LeaseOut)
+def claim_handoff(claim_code: str, db: sqlite3.Connection = Depends(get_db)) -> dict:
+    with write_tx(db):
+        return service.claim_handoff(db, claim_code)
 
 
 # ---------- audit chain ----------

@@ -1,5 +1,6 @@
 """End-to-end tests. Run with: pytest -q"""
 
+import hashlib
 import os
 import tempfile
 import time
@@ -483,3 +484,191 @@ def test_resize_ipv6(client):
         "after_cidr": "2001:db8::/48",
     }
     _assert_chain_linkage(events)
+
+
+# ---------- lease handoffs ----------
+
+def _create_lease(client, pid, prefix_len=27, ttl_seconds=3600):
+    r = client.post(
+        f"/pools/{pid}/leases",
+        json={"prefix_len": prefix_len, "ttl_seconds": ttl_seconds},
+    )
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def _issue_handoff(client, token, ttl_seconds=None):
+    body = {} if ttl_seconds is None else {"ttl_seconds": ttl_seconds}
+    r = client.post(f"/leases/{token}/handoffs", json=body)
+    assert r.status_code == 201, r.text
+    return r.json()
+
+
+def test_handoff_issue_and_claim_rotates_token(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+
+    handoff = _issue_handoff(client, lease["token"], ttl_seconds=600)
+    assert handoff["claim_code"]
+    now = int(time.time())
+    assert now < handoff["expires_at"] <= now + 600
+
+    r = client.post(f"/lease-handoffs/{handoff['claim_code']}/claim")
+    assert r.status_code == 200
+    out = r.json()
+    assert out["id"] == lease["id"]
+    assert out["cidr"] == lease["cidr"]  # CIDR unchanged
+    assert out["expires_at"] == lease["expires_at"]  # expiry unchanged
+    assert out["token"] != lease["token"]  # token rotated
+    assert out["status"] == "active"
+
+    # the old token is now unknown everywhere
+    assert client.get(f"/leases/{lease['token']}").status_code == 404
+    assert client.post(f"/leases/{lease['token']}/renew", json={}).status_code == 404
+    assert client.post(f"/leases/{lease['token']}/release").status_code == 404
+    # the new token works
+    assert client.get(f"/leases/{out['token']}").json()["id"] == lease["id"]
+
+
+def test_handoff_default_ttl(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    handoff = _issue_handoff(client, lease["token"])
+    now = int(time.time())
+    assert now < handoff["expires_at"] <= now + 300
+
+
+def test_handoff_ttl_validation(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    url = f"/leases/{lease['token']}/handoffs"
+    assert client.post(url, json={"ttl_seconds": 0}).status_code == 422
+    assert client.post(url, json={"ttl_seconds": 3601}).status_code == 422
+    assert client.post(url, json={"ttl_seconds": -5}).status_code == 422
+    assert client.post(url, json={"ttl_seconds": 1}).status_code == 201
+    assert client.post(url, json={"ttl_seconds": 3600}).status_code == 201
+
+
+def test_handoff_reissue_invalidates_old_code(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    first = _issue_handoff(client, lease["token"])["claim_code"]
+    second = _issue_handoff(client, lease["token"])["claim_code"]
+    assert first != second
+
+    # the replaced code conflicts; the fresh one claims successfully
+    assert client.post(f"/lease-handoffs/{first}/claim").status_code == 409
+    r = client.post(f"/lease-handoffs/{second}/claim")
+    assert r.status_code == 200
+    assert r.json()["id"] == lease["id"]
+
+
+def test_handoff_consumed_code_conflicts(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 200
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_expired_code_conflicts(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"], ttl_seconds=1)["claim_code"]
+    time.sleep(1.2)
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_unknown_code_404(client):
+    assert client.post("/lease-handoffs/nope/claim").status_code == 404
+
+
+def test_handoff_issue_requires_active_lease(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    assert client.post("/leases/nope/handoffs", json={}).status_code == 404
+
+    lease = _create_lease(client, pid)
+    client.post(f"/leases/{lease['token']}/release")
+    assert client.post(f"/leases/{lease['token']}/handoffs", json={}).status_code == 409
+
+    expiring = _create_lease(client, pid, ttl_seconds=1)
+    time.sleep(1.2)
+    r = client.post(f"/leases/{expiring['token']}/handoffs", json={})
+    assert r.status_code == 409
+
+
+def test_handoff_claim_after_release_conflicts(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+    client.post(f"/leases/{lease['token']}/release")
+    # lease no longer active at claim time
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+
+def test_handoff_concurrent_claims_single_winner(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+
+    def claim(_):
+        return client.post(f"/lease-handoffs/{code}/claim")
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = list(pool.map(claim, range(8)))
+
+    successes = [r for r in results if r.status_code == 200]
+    failures = [r for r in results if r.status_code == 409]
+    assert len(successes) == 1
+    assert len(failures) == 7
+    new_token = successes[0].json()["token"]
+    assert client.get(f"/leases/{new_token}").status_code == 200
+    assert client.get(f"/leases/{lease['token']}").status_code == 404
+
+
+def test_handoff_db_stores_only_digest(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+
+    conn = connect()
+    rows = conn.execute("SELECT code_digest, status FROM lease_handoffs").fetchall()
+    conn.close()
+    assert len(rows) == 1
+    assert rows[0]["code_digest"] == hashlib.sha256(code.encode()).hexdigest()
+    assert rows[0]["code_digest"] != code  # the code itself is never stored
+    assert rows[0]["status"] == "pending"
+
+
+def test_handoff_audit_event_and_no_secret_leak(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+    digest = hashlib.sha256(code.encode()).hexdigest()
+    out = client.post(f"/lease-handoffs/{code}/claim").json()
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "handoff"]
+    handoff = events[1]
+    assert handoff["lease_id"] == lease["id"]
+    assert handoff["pool_id"] == pid
+    assert handoff["cidr"] == lease["cidr"]
+    # neither the claim code, its digest, nor any lease token leaks into the log
+    for secret in (code, digest, lease["token"], out["token"]):
+        assert secret not in str(events)
+    _assert_chain_linkage(events)
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}
+
+
+def test_handoff_failures_leave_no_event(client):
+    pid = _create_pool(client, cidr="10.0.0.0/24")
+    lease = _create_lease(client, pid)
+    code = _issue_handoff(client, lease["token"])["claim_code"]
+
+    assert client.post("/lease-handoffs/nope/claim").status_code == 404
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 200
+    assert client.post(f"/lease-handoffs/{code}/claim").status_code == 409
+
+    events = client.get("/audit/events").json()
+    assert [e["action"] for e in events] == ["allocate", "handoff"]
+    assert client.get("/audit/verify").json() == {"valid": True, "invalid_seq": None}

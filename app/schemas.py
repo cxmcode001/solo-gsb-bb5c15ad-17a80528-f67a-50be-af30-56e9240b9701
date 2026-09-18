@@ -42,6 +42,15 @@ class ResizeRequest(BaseModel):
     target_prefix_len: int = Field(..., ge=0, le=128, examples=[26])
 
 
+class HandoffRequest(BaseModel):
+    ttl_seconds: int | None = Field(None, ge=1, le=3600)
+
+
+class HandoffOut(BaseModel):
+    claim_code: str
+    expires_at: int
+
+
 class LeaseOut(BaseModel):
     id: int
     pool_id: int
